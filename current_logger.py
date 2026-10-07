@@ -45,9 +45,6 @@ def main():
         # Запуск измерений
         ppk2.start_measuring()
 
-        # Точка отсчёта для timestamp (монотонное время в секундах)
-        start_time = time.monotonic()
-
         print(f"Запись в {csv_file_path} на частоте {SAMPLE_RATE_HZ} Гц")
         print("Нажмите Ctrl+C для остановки...")
 
@@ -73,8 +70,8 @@ def main():
                         # Средний ток за период опроса (в мкА)
                         avg_current = sum(samples) / len(samples)
 
-                        # timestamp — float секунд от начала записи
-                        timestamp = time.monotonic() - start_time
+                        # timestamp — абсолютное Unix-время в секундах (float)
+                        timestamp = time.time()
 
                         # Записываем строку и сразу сбрасываем на диск
                         writer.writerow([f"{timestamp:.6f}", f"{avg_current:.3f}"])

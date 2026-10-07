@@ -1,135 +1,104 @@
-import serial
+import os
 import csv
 import time
 from pathlib import Path
 from datetime import datetime
-from threading import Thread, Event
-from queue import Queue, Empty
+import serial
+
 
 # --- Настройки ---
-PORT       = 'COM9'           # замените на ваш
-BAUDRATE   = 115200
-TIMEOUT    = 1                # сек, readline()
-LOG_ROOT   = Path('log')
-TAG        = 'voltage'
-FLUSH_EVERY = 10              # сбрасывать на диск каждые N строк
+PORT         = 'COM9'          # замените на ваш
+BAUDRATE     = 115200
+TIMEOUT      = 1               # сек, readline()
+LOG_ROOT     = Path('log')
+TAG          = 'voltage'
+FLUSH_EVERY  = 10              # сбрасывать на диск каждые N строк
+VOLTAGE_UNIT = 'V'             # единица измерения напряжения
 
-def make_log_dir():
-    """Создаёт log/<YYYY-MM-DD_HH-MM-SS>_voltage/ и возвращает путь."""
-    LOG_ROOT.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    d = LOG_ROOT / f'{stamp}_{TAG}'
-    d.mkdir()
-    return d
 
-def reader_thread(ser, q: Queue, stop: Event):
-    """Читает Serial и кладёт (timestamp, voltage) в очередь."""
-    while not stop.is_set():
-        try:
-            raw = ser.readline()
-        except serial.SerialException as e:
-            q.put(('__ERROR__', f'SerialException: {e}'))
-            break
+def create_log_directory() -> Path:
+    """Создаёт папку log/{время-старта}_{TAG}/ и возвращает её путь."""
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_path = LOG_ROOT / f'{timestamp}_{TAG}'
+    log_path.mkdir(parents=True, exist_ok=True)
+    return log_path
 
-        if not raw:
-            continue  # таймаут, просто ждём
 
-        line = raw.decode('ascii', errors='ignore').strip()
-        if not line:
-            continue
+def parse_voltage(line: str) -> float | None:
+    """Извлекает число из строки, пришедшей с Arduino."""
+    line = line.strip()
+    if not line:
+        return None
 
-        # Пропускаем баннер "CR1632 Battery Logger"
-        try:
-            voltage = float(line)
-        except ValueError:
-            q.put(('__SKIP__', line))
-            continue
+    # Если Arduino шлёт "VOLTAGE:1.234" — берём часть после двоеточия
+    if ':' in line:
+        line = line.split(':', 1)[1].strip()
 
-        # timestamp ставится здесь — максимально близко к моменту приёма
-        q.put((time.time(), voltage))
+    try:
+        return float(line)
+    except ValueError:
+        return None
 
-    q.put(('__EOF__', None))
-
-def writer_thread(q: Queue, stop: Event, csv_path: Path, err_path: Path):
-    """Пишет данные из очереди в CSV."""
-    n = 0
-    with open(csv_path, 'w', newline='') as f, \
-         open(err_path, 'a') as fe:
-
-        w = csv.writer(f)
-        w.writerow(['timestamp', 'voltage'])
-        f.flush()
-
-        while not stop.is_set() or not q.empty():
-            try:
-                item = q.get(timeout=0.5)
-            except Empty:
-                continue
-
-            kind, payload = item
-
-            if kind == '__EOF__':
-                break
-            elif kind == '__SKIP__':
-                fe.write(f'{datetime.now().isoformat()} SKIP: {payload!r}\n')
-                fe.flush()
-                continue
-            elif kind == '__ERROR__':
-                fe.write(f'{datetime.now().isoformat()} ERROR: {payload}\n')
-                fe.flush()
-                break
-
-            ts, v = kind, payload
-            # ts — Unix time (float, секунды с долями)
-            w.writerow([f'{ts:.3f}', f'{v:.5f}'])
-            n += 1
-
-            if n % FLUSH_EVERY == 0:
-                f.flush()
-
-            if n % 100 == 0:
-                print(f'{n} строк записано', end='\r')
-
-        f.flush()
-
-    print(f'\nИтого: {n} строк → {csv_path}')
 
 def main():
-    log_dir = make_log_dir()
-    csv_path = log_dir / 'data.csv'
-    err_path = log_dir / 'errors.log'
-    print(f'Лог: {csv_path}')
+    log_path = create_log_directory()
+    csv_file_path = log_path / 'data.csv'
 
-    try:
+    # Открываем файл в режиме потоковой записи
+    with open(csv_file_path, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['timestamp', f'voltage_{VOLTAGE_UNIT}'])
+        csv_file.flush()
+        os.fsync(csv_file.fileno())
+
+        # Открываем последовательный порт
         ser = serial.Serial(PORT, BAUDRATE, timeout=TIMEOUT)
-    except serial.SerialException as e:
-        print(f'Не удалось открыть {PORT}: {e}')
-        return
 
-    time.sleep(2)  # ждём автосброс Arduino (DTR)
+        rows_since_flush = 0
 
-    q = Queue(maxsize=10000)
-    stop = Event()
+        print(f'Порт {PORT} открыт, скорость {BAUDRATE}')
+        print(f'Запись в {csv_file_path}')
+        print('Нажмите Ctrl+C для остановки...')
 
-    t_read  = Thread(target=reader_thread,  args=(ser, q, stop), daemon=True)
-    t_write = Thread(target=writer_thread, args=(q, stop, csv_path, err_path), daemon=True)
+        try:
+            while True:
+                raw = ser.readline()
 
-    t_read.start()
-    t_write.start()
+                if not raw:
+                    # Таймаут — нет данных, продолжаем ждать
+                    continue
 
-    try:
-        # Основной поток просто ждёт Ctrl+C
-        while t_write.is_alive():
-            t_write.join(timeout=0.5)
-    except KeyboardInterrupt:
-        print('\nОстановка...')
+                try:
+                    line = raw.decode('utf-8', errors='ignore')
+                except UnicodeDecodeError:
+                    continue
 
-    stop.set()
-    t_read.join(timeout=2)
-    t_write.join(timeout=5)
+                voltage = parse_voltage(line)
+                if voltage is None:
+                    continue
 
-    if ser.is_open:
-        ser.close()
+                # timestamp — абсолютное Unix-время в секундах (float)
+                timestamp = time.time()
+                print(f"{voltage=}")
+                writer.writerow([f'{timestamp:.6f}', f'{voltage:.6f}'])
+                rows_since_flush += 1
+
+                # Периодический сброс на диск
+                if rows_since_flush >= FLUSH_EVERY:
+                    csv_file.flush()
+                    os.fsync(csv_file.fileno())
+                    rows_since_flush = 0
+
+        except KeyboardInterrupt:
+            print('\nОстановка записи...')
+
+        finally:
+            # Финальный сброс буфера
+            csv_file.flush()
+            os.fsync(csv_file.fileno())
+            ser.close()
+            print(f'Лог сохранён: {csv_file_path}')
+
 
 if __name__ == '__main__':
     main()
